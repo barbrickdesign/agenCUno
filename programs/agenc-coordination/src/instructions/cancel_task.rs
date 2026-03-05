@@ -57,7 +57,15 @@ pub struct CancelTask<'info> {
     pub token_program: Option<Program<'info, Token>>,
 }
 
-pub fn handler(ctx: Context<CancelTask>) -> Result<()> {
+pub fn process_cancel_task(ctx: Context<CancelTask>) -> Result<()> {
+    require!(
+        ctx.accounts.creator.is_signer,
+        CoordinationError::UnauthorizedTaskAction
+    );
+    process_cancel_task_impl(ctx)
+}
+
+fn process_cancel_task_impl(ctx: Context<CancelTask>) -> Result<()> {
     check_version_compatible(&ctx.accounts.protocol_config)?;
 
     let task = &mut ctx.accounts.task;
