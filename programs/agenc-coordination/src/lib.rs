@@ -21,8 +21,8 @@ pub mod instructions;
 pub mod state;
 pub mod utils;
 
-use instructions::*;
 use crate::errors::CoordinationError;
+use instructions::*;
 
 #[program]
 pub mod agenc_coordination {
