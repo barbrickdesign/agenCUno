@@ -33,7 +33,10 @@ pub(crate) fn validate_remaining_accounts_structure(
     );
 
     // Additional accounts must come in pairs (claim, worker)
-    let extra_accounts = remaining_accounts.len() - arbiter_accounts;
+    let extra_accounts = remaining_accounts
+        .len()
+        .checked_sub(arbiter_accounts)
+        .ok_or(CoordinationError::ArithmeticOverflow)?;
     require!(extra_accounts % 2 == 0, CoordinationError::InvalidInput);
 
     Ok(arbiter_accounts)
@@ -50,7 +53,10 @@ pub(crate) fn check_duplicate_arbiters(
     let mut seen_votes: HashSet<Pubkey> = HashSet::new();
     for i in (0..arbiter_accounts).step_by(2) {
         let vote_key = remaining_accounts[i].key();
-        let arbiter_key = remaining_accounts[i + 1].key();
+        let arbiter_index = i
+            .checked_add(1)
+            .ok_or(CoordinationError::ArithmeticOverflow)?;
+        let arbiter_key = remaining_accounts[arbiter_index].key();
         require!(
             seen_votes.insert(vote_key),
             CoordinationError::DuplicateArbiter
@@ -77,7 +83,10 @@ pub(crate) fn check_duplicate_workers(
         seen_workers.insert(worker_key);
     }
     for i in (arbiter_accounts..remaining_accounts.len()).step_by(2) {
-        let worker_key = remaining_accounts[i + 1].key();
+        let worker_index = i
+            .checked_add(1)
+            .ok_or(CoordinationError::ArithmeticOverflow)?;
+        let worker_key = remaining_accounts[worker_index].key();
         require!(
             seen_workers.insert(worker_key),
             CoordinationError::InvalidInput
@@ -148,6 +157,7 @@ pub(crate) fn process_worker_claim_pair(
 ) -> Result<()> {
     validate_account_owner(claim_info)?;
     validate_account_owner(worker_info)?;
+    require!(claim_info.is_writable, CoordinationError::InvalidInput);
 
     // Validate claim PDA derivation to prevent crafted program-owned accounts
     let (expected_claim_pda, _) = Pubkey::find_program_address(
@@ -176,6 +186,22 @@ pub(crate) fn process_worker_claim_pair(
     // Use AnchorSerialize::serialize (Borsh only) — see process_arbiter_vote_pair comment (fix #960).
     AnchorSerialize::serialize(&worker_reg, &mut &mut worker_data[8..])
         .map_err(|_| anchor_lang::error::ErrorCode::AccountDidNotSerialize)?;
+    drop(worker_data);
+
+    // Close the processed claim account. Rent is credited to the worker PDA so
+    // funds remain recoverable via normal agent lifecycle and no stale claims
+    // block cleanup flows after dispute resolution/expiration.
+    let claim_lamports = claim_info.lamports();
+    **claim_info.try_borrow_mut_lamports()? = 0;
+    **worker_info.try_borrow_mut_lamports()? = worker_info
+        .lamports()
+        .checked_add(claim_lamports)
+        .ok_or(CoordinationError::ArithmeticOverflow)?;
+
+    // Mark as closed to block `init_if_needed` reinitialization on the same PDA.
+    let mut claim_data_mut = claim_info.try_borrow_mut_data()?;
+    claim_data_mut.fill(0);
+    claim_data_mut[..8].copy_from_slice(&[255u8; 8]);
 
     Ok(())
 }

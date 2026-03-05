@@ -22,7 +22,8 @@ pub struct StakeReputation<'info> {
         payer = authority,
         space = ReputationStake::SIZE,
         seeds = [b"reputation_stake", agent.key().as_ref()],
-        bump
+        bump,
+        constraint = reputation_stake.key() != agent.key() @ CoordinationError::InvalidInput
     )]
     pub reputation_stake: Account<'info, ReputationStake>,
 
@@ -40,6 +41,16 @@ pub fn handler(ctx: Context<StakeReputation>, amount: u64) -> Result<()> {
 
     let clock = Clock::get()?;
     let stake = &mut ctx.accounts.reputation_stake;
+
+    // Defense-in-depth: bind stake account identity to this agent for all
+    // non-fresh accounts. This prevents accidental mismatches after future
+    // migrations/refactors around init_if_needed flows.
+    if stake.agent != Pubkey::default() {
+        require!(
+            stake.agent == ctx.accounts.agent.key(),
+            CoordinationError::InvalidInput
+        );
+    }
 
     // Initialize on first use
     if stake.agent == Pubkey::default() {

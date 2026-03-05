@@ -21,7 +21,8 @@ pub struct UpdateState<'info> {
         mut,
         seeds = [b"agent", agent.agent_id.as_ref()],
         bump = agent.bump,
-        has_one = authority @ CoordinationError::UnauthorizedAgent
+        has_one = authority @ CoordinationError::UnauthorizedAgent,
+        constraint = agent.key() != state.key() @ CoordinationError::InvalidInput
     )]
     pub agent: Account<'info, AgentRegistration>,
 
@@ -86,6 +87,10 @@ pub fn handler(
     // For existing state, verify the updating agent is the owner
     let is_new_state = state.version == 0 && state.last_updater == Pubkey::default();
     if !is_new_state {
+        require!(
+            state.owner == ctx.accounts.authority.key(),
+            CoordinationError::StateOwnershipViolation
+        );
         require!(
             state.last_updater == agent.key(),
             CoordinationError::StateOwnershipViolation

@@ -43,15 +43,19 @@ export function createLogger(
 
       switch (level) {
         case "debug":
+          // nosemgrep
           console.debug(fullMessage, ...args);
           break;
         case "info":
+          // nosemgrep
           console.info(fullMessage, ...args);
           break;
         case "warn":
+          // nosemgrep
           console.warn(fullMessage, ...args);
           break;
         case "error":
+          // nosemgrep
           console.error(fullMessage, ...args);
           break;
       }

@@ -12,6 +12,7 @@ use crate::instructions::lamport_transfer::{credit_lamports, debit_lamports, tra
 use crate::instructions::slash_helpers::calculate_slash_amount;
 use crate::instructions::token_helpers::{
     close_token_escrow, transfer_tokens_from_escrow, validate_token_account,
+    validate_unchecked_token_mint,
 };
 use crate::state::{
     AgentRegistration, Dispute, DisputeStatus, ProtocolConfig, ResolutionType, Task, TaskClaim,
@@ -55,11 +56,10 @@ pub struct ResolveDispute<'info> {
     pub protocol_config: Box<Account<'info, ProtocolConfig>>,
 
     #[account(
-        constraint = resolver.key() == protocol_config.authority
-            || resolver.key() == dispute.initiator_authority
+        constraint = authority.key() == protocol_config.authority
             @ CoordinationError::UnauthorizedResolver
     )]
-    pub resolver: Signer<'info>,
+    pub authority: Signer<'info>,
 
     /// CHECK: Task creator for refund - validated to match task.creator (fix #58)
     #[account(
@@ -83,9 +83,9 @@ pub struct ResolveDispute<'info> {
     #[account(mut)]
     pub worker: Option<Box<Account<'info, AgentRegistration>>>,
 
-    /// CHECK: Worker's authority wallet for receiving payment
+    /// CHECK: Worker's wallet for receiving payment
     #[account(mut)]
-    pub worker_authority: Option<UncheckedAccount<'info>>,
+    pub worker_wallet: Option<UncheckedAccount<'info>>,
 
     pub system_program: Program<'info, System>,
 
@@ -123,17 +123,15 @@ pub fn handler(ctx: Context<ResolveDispute>) -> Result<()> {
     let clock = Clock::get()?;
 
     check_version_compatible(config)?;
+    require!(
+        ctx.accounts.authority.is_signer,
+        CoordinationError::UnauthorizedResolver
+    );
 
     // Verify dispute is active
     require!(
         dispute.status == DisputeStatus::Active,
         CoordinationError::DisputeNotActive
-    );
-
-    // Prevent initiator from resolving their own dispute (fix #458)
-    require!(
-        ctx.accounts.resolver.key() != dispute.initiator_authority,
-        CoordinationError::InitiatorCannotResolve
     );
 
     // Verify voting period has ended
@@ -147,7 +145,7 @@ pub fn handler(ctx: Context<ResolveDispute>) -> Result<()> {
         dispute.as_ref(),
         &ctx.accounts.worker,
         &ctx.accounts.worker_claim,
-        &ctx.accounts.worker_authority,
+        &ctx.accounts.worker_wallet,
         &task.key(),
     )?;
 
@@ -175,8 +173,12 @@ pub fn handler(ctx: Context<ResolveDispute>) -> Result<()> {
         CoordinationError::InvalidStatusTransition
     );
 
-    let (approved, outcome) =
-        determine_dispute_outcome(dispute.votes_for, dispute.votes_against, total_votes, config)?;
+    let (approved, outcome) = determine_dispute_outcome(
+        dispute.votes_for,
+        dispute.votes_against,
+        total_votes,
+        config,
+    )?;
 
     // Calculate remaining escrow funds
     let remaining_funds = escrow
@@ -201,14 +203,36 @@ pub fn handler(ctx: Context<ResolveDispute>) -> Result<()> {
                 && ctx.accounts.token_program.is_some(),
             CoordinationError::MissingTokenAccounts
         );
-        let mint = ctx.accounts.reward_mint.as_ref().unwrap();
+        let mint = ctx
+            .accounts
+            .reward_mint
+            .as_ref()
+            .ok_or(CoordinationError::MissingTokenAccounts)?;
+        let expected_mint = task
+            .reward_mint
+            .ok_or(CoordinationError::InvalidTokenMint)?;
         require!(
-            mint.key() == task.reward_mint.unwrap(),
+            mint.key() == expected_mint,
             CoordinationError::InvalidTokenMint
         );
-        let token_escrow = ctx.accounts.token_escrow_ata.as_ref().unwrap();
+        let token_escrow = ctx
+            .accounts
+            .token_escrow_ata
+            .as_ref()
+            .ok_or(CoordinationError::MissingTokenAccounts)?;
         validate_token_account(token_escrow, &mint.key(), &escrow.key())?;
     }
+    let token_escrow_starting_amount = if is_token_task {
+        let token_escrow = ctx
+            .accounts
+            .token_escrow_ata
+            .as_ref()
+            .ok_or(CoordinationError::MissingTokenAccounts)?;
+        anchor_spl::token::accessor::amount(&token_escrow.to_account_info())
+            .map_err(|_| CoordinationError::TokenTransferFailed)?
+    } else {
+        0
+    };
 
     // A worker "loses" when dispute is approved and resolution is not Complete.
     // This matches apply_dispute_slash semantics.
@@ -223,12 +247,16 @@ pub fn handler(ctx: Context<ResolveDispute>) -> Result<()> {
         0
     };
     let token_slash_reserve = if is_token_task && worker_lost {
-        slash_amount.min(remaining_funds)
+        remaining_funds
+            .checked_mul(config.slash_percentage as u64)
+            .ok_or(CoordinationError::ArithmeticOverflow)?
+            .checked_div(PERCENT_BASE)
+            .ok_or(CoordinationError::ArithmeticOverflow)?
     } else {
         0
     };
-    let worker_slash_pending = worker_lost && slash_amount > 0;
-    let defer_token_escrow_close = is_token_task && worker_slash_pending;
+    let worker_slash_pending = worker_lost && (slash_amount > 0 || token_slash_reserve > 0);
+    let defer_token_escrow_close = is_token_task && token_slash_reserve > 0;
     let defer_worker_claim_close = worker_slash_pending;
 
     // Pre-compute escrow PDA signer seeds (used by all token paths)
@@ -241,13 +269,35 @@ pub fn handler(ctx: Context<ResolveDispute>) -> Result<()> {
         match dispute.resolution_type {
             ResolutionType::Refund => {
                 if is_token_task {
-                    let token_escrow = ctx.accounts.token_escrow_ata.as_ref().unwrap();
-                    let token_program = ctx.accounts.token_program.as_ref().unwrap();
+                    let token_escrow = ctx
+                        .accounts
+                        .token_escrow_ata
+                        .as_ref()
+                        .ok_or(CoordinationError::MissingTokenAccounts)?;
+                    let token_program = ctx
+                        .accounts
+                        .token_program
+                        .as_ref()
+                        .ok_or(CoordinationError::MissingTokenAccounts)?;
+                    let mint = ctx
+                        .accounts
+                        .reward_mint
+                        .as_ref()
+                        .ok_or(CoordinationError::MissingTokenAccounts)?;
                     require!(
                         ctx.accounts.creator_token_account.is_some(),
                         CoordinationError::MissingTokenAccounts
                     );
-                    let creator_ta = ctx.accounts.creator_token_account.as_ref().unwrap();
+                    let creator_ta = ctx
+                        .accounts
+                        .creator_token_account
+                        .as_ref()
+                        .ok_or(CoordinationError::MissingTokenAccounts)?;
+                    validate_unchecked_token_mint(
+                        &creator_ta.to_account_info(),
+                        &mint.key(),
+                        &ctx.accounts.creator.key(),
+                    )?;
                     let creator_refund = remaining_funds
                         .checked_sub(token_slash_reserve)
                         .ok_or(CoordinationError::ArithmeticOverflow)?;
@@ -260,8 +310,13 @@ pub fn handler(ctx: Context<ResolveDispute>) -> Result<()> {
                         token_program,
                     )?;
                     if !defer_token_escrow_close {
+                        let residual_amount = token_escrow_starting_amount
+                            .checked_sub(creator_refund)
+                            .ok_or(CoordinationError::ArithmeticOverflow)?;
                         close_token_escrow(
                             token_escrow,
+                            residual_amount,
+                            &creator_ta.to_account_info(),
                             &ctx.accounts.creator.to_account_info(),
                             &escrow.to_account_info(),
                             escrow_seeds,
@@ -278,15 +333,41 @@ pub fn handler(ctx: Context<ResolveDispute>) -> Result<()> {
                 task.status = TaskStatus::Cancelled;
             }
             ResolutionType::Complete => {
-                let worker_authority = ctx.accounts.worker_authority.as_ref().unwrap();
+                let worker_wallet = ctx
+                    .accounts
+                    .worker_wallet
+                    .as_ref()
+                    .ok_or(CoordinationError::IncompleteWorkerAccounts)?;
                 if is_token_task {
-                    let token_escrow = ctx.accounts.token_escrow_ata.as_ref().unwrap();
-                    let token_program = ctx.accounts.token_program.as_ref().unwrap();
+                    let token_escrow = ctx
+                        .accounts
+                        .token_escrow_ata
+                        .as_ref()
+                        .ok_or(CoordinationError::MissingTokenAccounts)?;
+                    let token_program = ctx
+                        .accounts
+                        .token_program
+                        .as_ref()
+                        .ok_or(CoordinationError::MissingTokenAccounts)?;
+                    let mint = ctx
+                        .accounts
+                        .reward_mint
+                        .as_ref()
+                        .ok_or(CoordinationError::MissingTokenAccounts)?;
                     require!(
                         ctx.accounts.worker_token_account_ata.is_some(),
                         CoordinationError::MissingTokenAccounts
                     );
-                    let worker_ta = ctx.accounts.worker_token_account_ata.as_ref().unwrap();
+                    let worker_ta = ctx
+                        .accounts
+                        .worker_token_account_ata
+                        .as_ref()
+                        .ok_or(CoordinationError::MissingTokenAccounts)?;
+                    validate_unchecked_token_mint(
+                        &worker_ta.to_account_info(),
+                        &mint.key(),
+                        &worker_wallet.key(),
+                    )?;
                     transfer_tokens_from_escrow(
                         token_escrow,
                         &worker_ta.to_account_info(),
@@ -295,8 +376,13 @@ pub fn handler(ctx: Context<ResolveDispute>) -> Result<()> {
                         escrow_seeds,
                         token_program,
                     )?;
+                    let residual_amount = token_escrow_starting_amount
+                        .checked_sub(remaining_funds)
+                        .ok_or(CoordinationError::ArithmeticOverflow)?;
                     close_token_escrow(
                         token_escrow,
+                        residual_amount,
+                        &worker_ta.to_account_info(),
                         &ctx.accounts.creator.to_account_info(),
                         &escrow.to_account_info(),
                         escrow_seeds,
@@ -305,7 +391,7 @@ pub fn handler(ctx: Context<ResolveDispute>) -> Result<()> {
                 } else {
                     transfer_lamports(
                         &escrow.to_account_info(),
-                        &worker_authority.to_account_info(),
+                        &worker_wallet.to_account_info(),
                         remaining_funds,
                     )?;
                 }
@@ -325,18 +411,53 @@ pub fn handler(ctx: Context<ResolveDispute>) -> Result<()> {
                         .checked_sub(worker_share)
                         .ok_or(CoordinationError::ArithmeticOverflow)?;
 
-                    let worker_authority = ctx.accounts.worker_authority.as_ref().unwrap();
+                    let worker_wallet = ctx
+                        .accounts
+                        .worker_wallet
+                        .as_ref()
+                        .ok_or(CoordinationError::IncompleteWorkerAccounts)?;
 
                     if is_token_task {
-                        let token_escrow = ctx.accounts.token_escrow_ata.as_ref().unwrap();
-                        let token_program = ctx.accounts.token_program.as_ref().unwrap();
+                        let token_escrow = ctx
+                            .accounts
+                            .token_escrow_ata
+                            .as_ref()
+                            .ok_or(CoordinationError::MissingTokenAccounts)?;
+                        let token_program = ctx
+                            .accounts
+                            .token_program
+                            .as_ref()
+                            .ok_or(CoordinationError::MissingTokenAccounts)?;
+                        let mint = ctx
+                            .accounts
+                            .reward_mint
+                            .as_ref()
+                            .ok_or(CoordinationError::MissingTokenAccounts)?;
                         require!(
                             ctx.accounts.creator_token_account.is_some()
                                 && ctx.accounts.worker_token_account_ata.is_some(),
                             CoordinationError::MissingTokenAccounts
                         );
-                        let creator_ta = ctx.accounts.creator_token_account.as_ref().unwrap();
-                        let worker_ta = ctx.accounts.worker_token_account_ata.as_ref().unwrap();
+                        let creator_ta = ctx
+                            .accounts
+                            .creator_token_account
+                            .as_ref()
+                            .ok_or(CoordinationError::MissingTokenAccounts)?;
+                        let worker_ta = ctx
+                            .accounts
+                            .worker_token_account_ata
+                            .as_ref()
+                            .ok_or(CoordinationError::MissingTokenAccounts)?;
+                        validate_unchecked_token_mint(
+                            &creator_ta.to_account_info(),
+                            &mint.key(),
+                            &ctx.accounts.creator.key(),
+                        )?;
+                        validate_unchecked_token_mint(
+                            &worker_ta.to_account_info(),
+                            &mint.key(),
+                            &worker_wallet.key(),
+                        )?;
                         transfer_tokens_from_escrow(
                             token_escrow,
                             &creator_ta.to_account_info(),
@@ -354,8 +475,16 @@ pub fn handler(ctx: Context<ResolveDispute>) -> Result<()> {
                             token_program,
                         )?;
                         if !defer_token_escrow_close {
+                            let split_total = creator_share
+                                .checked_add(worker_share)
+                                .ok_or(CoordinationError::ArithmeticOverflow)?;
+                            let residual_amount = token_escrow_starting_amount
+                                .checked_sub(split_total)
+                                .ok_or(CoordinationError::ArithmeticOverflow)?;
                             close_token_escrow(
                                 token_escrow,
+                                residual_amount,
+                                &creator_ta.to_account_info(),
                                 &ctx.accounts.creator.to_account_info(),
                                 &escrow.to_account_info(),
                                 escrow_seeds,
@@ -366,7 +495,7 @@ pub fn handler(ctx: Context<ResolveDispute>) -> Result<()> {
                         debit_lamports(&escrow.to_account_info(), remaining_funds)?;
                         let creator_info = ctx.accounts.creator.to_account_info();
                         credit_lamports(&creator_info, creator_share)?;
-                        credit_lamports(&worker_authority.to_account_info(), worker_share)?;
+                        credit_lamports(&worker_wallet.to_account_info(), worker_share)?;
                     }
                 }
                 task.status = TaskStatus::Cancelled;
@@ -375,13 +504,35 @@ pub fn handler(ctx: Context<ResolveDispute>) -> Result<()> {
     } else {
         // Dispute rejected - refund to creator by default
         if is_token_task {
-            let token_escrow = ctx.accounts.token_escrow_ata.as_ref().unwrap();
-            let token_program = ctx.accounts.token_program.as_ref().unwrap();
+            let token_escrow = ctx
+                .accounts
+                .token_escrow_ata
+                .as_ref()
+                .ok_or(CoordinationError::MissingTokenAccounts)?;
+            let token_program = ctx
+                .accounts
+                .token_program
+                .as_ref()
+                .ok_or(CoordinationError::MissingTokenAccounts)?;
+            let mint = ctx
+                .accounts
+                .reward_mint
+                .as_ref()
+                .ok_or(CoordinationError::MissingTokenAccounts)?;
             require!(
                 ctx.accounts.creator_token_account.is_some(),
                 CoordinationError::MissingTokenAccounts
             );
-            let creator_ta = ctx.accounts.creator_token_account.as_ref().unwrap();
+            let creator_ta = ctx
+                .accounts
+                .creator_token_account
+                .as_ref()
+                .ok_or(CoordinationError::MissingTokenAccounts)?;
+            validate_unchecked_token_mint(
+                &creator_ta.to_account_info(),
+                &mint.key(),
+                &ctx.accounts.creator.key(),
+            )?;
             transfer_tokens_from_escrow(
                 token_escrow,
                 &creator_ta.to_account_info(),
@@ -390,8 +541,13 @@ pub fn handler(ctx: Context<ResolveDispute>) -> Result<()> {
                 escrow_seeds,
                 token_program,
             )?;
+            let residual_amount = token_escrow_starting_amount
+                .checked_sub(remaining_funds)
+                .ok_or(CoordinationError::ArithmeticOverflow)?;
             close_token_escrow(
                 token_escrow,
+                residual_amount,
+                &creator_ta.to_account_info(),
                 &ctx.accounts.creator.to_account_info(),
                 &escrow.to_account_info(),
                 escrow_seeds,
@@ -412,7 +568,7 @@ pub fn handler(ctx: Context<ResolveDispute>) -> Result<()> {
         .accounts
         .worker
         .as_mut()
-        .expect("worker account validated above");
+        .ok_or(CoordinationError::WorkerAgentRequired)?;
     worker.active_tasks = worker
         .active_tasks
         .checked_sub(1)
@@ -434,15 +590,25 @@ pub fn handler(ctx: Context<ResolveDispute>) -> Result<()> {
     check_duplicate_arbiters(ctx.remaining_accounts, arbiter_accounts)?;
 
     for i in (0..arbiter_accounts).step_by(2) {
+        let arbiter_index = i
+            .checked_add(1)
+            .ok_or(CoordinationError::ArithmeticOverflow)?;
         process_arbiter_vote_pair(
             &ctx.remaining_accounts[i],
-            &ctx.remaining_accounts[i + 1],
+            &ctx.remaining_accounts[arbiter_index],
             &dispute.key(),
             &crate::ID,
         )?;
     }
 
-    let worker_pairs = (ctx.remaining_accounts.len() - arbiter_accounts) / 2;
+    let remaining_worker_accounts = ctx
+        .remaining_accounts
+        .len()
+        .checked_sub(arbiter_accounts)
+        .ok_or(CoordinationError::ArithmeticOverflow)?;
+    let worker_pairs = remaining_worker_accounts
+        .checked_div(2)
+        .ok_or(CoordinationError::ArithmeticOverflow)?;
     let expected_worker_pairs = usize::from(
         task.current_workers
             .checked_sub(1)
@@ -461,9 +627,12 @@ pub fn handler(ctx: Context<ResolveDispute>) -> Result<()> {
     )?;
 
     for i in (arbiter_accounts..ctx.remaining_accounts.len()).step_by(2) {
+        let worker_index = i
+            .checked_add(1)
+            .ok_or(CoordinationError::ArithmeticOverflow)?;
         process_worker_claim_pair(
             &ctx.remaining_accounts[i],
-            &ctx.remaining_accounts[i + 1],
+            &ctx.remaining_accounts[worker_index],
             &task.key(),
             &crate::ID,
         )?;
@@ -485,20 +654,20 @@ pub fn handler(ctx: Context<ResolveDispute>) -> Result<()> {
         escrow.close(ctx.accounts.creator.to_account_info())?;
     }
 
-    // Close worker_claim account and return rent lamports to worker authority (fix #838)
-    // The claim rent was paid by worker authority at creation, so return it there
+    // Close worker_claim account and return rent lamports to worker wallet (fix #838)
+    // The claim rent was paid by worker wallet at creation, so return it there
     if !defer_worker_claim_close {
         let claim = ctx
             .accounts
             .worker_claim
             .as_ref()
-            .expect("worker claim validated above");
-        let worker_authority = ctx
+            .ok_or(CoordinationError::WorkerClaimRequired)?;
+        let worker_wallet = ctx
             .accounts
-            .worker_authority
+            .worker_wallet
             .as_ref()
-            .expect("worker authority validated above");
-        claim.close(worker_authority.to_account_info())?;
+            .ok_or(CoordinationError::IncompleteWorkerAccounts)?;
+        claim.close(worker_wallet.to_account_info())?;
     }
 
     emit!(DisputeResolved {
@@ -518,7 +687,7 @@ fn validate_worker_accounts(
     dispute: &Dispute,
     worker: &Option<Box<Account<AgentRegistration>>>,
     worker_claim: &Option<Box<Account<TaskClaim>>>,
-    worker_authority: &Option<UncheckedAccount>,
+    worker_wallet: &Option<UncheckedAccount>,
     task_key: &Pubkey,
 ) -> Result<()> {
     let worker = worker
@@ -527,7 +696,7 @@ fn validate_worker_accounts(
     let worker_claim = worker_claim
         .as_ref()
         .ok_or(CoordinationError::WorkerClaimRequired)?;
-    let worker_authority = worker_authority
+    let worker_wallet = worker_wallet
         .as_ref()
         .ok_or(CoordinationError::IncompleteWorkerAccounts)?;
 
@@ -549,9 +718,9 @@ fn validate_worker_accounts(
         CoordinationError::NotClaimed
     );
 
-    // Verify worker authority binding.
+    // Verify worker wallet binding.
     require!(
-        worker_authority.key() == worker.authority,
+        worker_wallet.key() == worker.authority,
         CoordinationError::UnauthorizedAgent
     );
 

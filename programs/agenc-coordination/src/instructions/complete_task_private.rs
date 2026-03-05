@@ -21,22 +21,18 @@ use solana_sha256_hasher::hashv;
 const RISC0_JOURNAL_LEN: usize = 192;
 const RISC0_SELECTOR_LEN: usize = 4;
 const RISC0_IMAGE_ID_LEN: usize = 32;
-const RISC0_GROTH16_SEAL_LEN: usize = 256;
-const RISC0_SEAL_BORSH_LEN: usize = RISC0_SELECTOR_LEN + RISC0_GROTH16_SEAL_LEN;
+const RISC0_SEAL_BORSH_LEN: usize = 260;
 
 // Journal field offsets (each field is HASH_SIZE=32 bytes)
 const JOURNAL_TASK_PDA_OFFSET: usize = 0;
 const JOURNAL_AUTHORITY_OFFSET: usize = HASH_SIZE; // 32
-const JOURNAL_CONSTRAINT_OFFSET: usize = 2 * HASH_SIZE; // 64
-const JOURNAL_COMMITMENT_OFFSET: usize = 3 * HASH_SIZE; // 96
-const JOURNAL_BINDING_OFFSET: usize = 4 * HASH_SIZE; // 128
-const JOURNAL_NULLIFIER_OFFSET: usize = 5 * HASH_SIZE; // 160
+const JOURNAL_CONSTRAINT_OFFSET: usize = 64;
+const JOURNAL_COMMITMENT_OFFSET: usize = 96;
+const JOURNAL_BINDING_OFFSET: usize = 128;
+const JOURNAL_NULLIFIER_OFFSET: usize = 160;
 const ROUTER_VERIFY_IX_DISCRIMINATOR: [u8; 8] = [133, 161, 141, 48, 120, 198, 88, 150];
 const VERIFIER_ENTRY_DISCRIMINATOR: [u8; 8] = [102, 247, 148, 158, 33, 153, 100, 93];
-const PUBKEY_BYTES: usize = 32;
-const ESTOPPED_FLAG_BYTES: usize = 1;
-const VERIFIER_ENTRY_ACCOUNT_LEN: usize =
-    8 + RISC0_SELECTOR_LEN + PUBKEY_BYTES + ESTOPPED_FLAG_BYTES;
+const VERIFIER_ENTRY_ACCOUNT_LEN: usize = 45;
 
 // Byte offsets within the VerifierEntry account data:
 // [0..8]   discriminator
@@ -44,8 +40,8 @@ const VERIFIER_ENTRY_ACCOUNT_LEN: usize =
 // [12..44] verifier pubkey (32 bytes)
 // [44]     estopped flag (1 byte)
 const VERIFIER_ENTRY_SELECTOR_OFFSET: usize = 8;
-const VERIFIER_ENTRY_VERIFIER_OFFSET: usize = VERIFIER_ENTRY_SELECTOR_OFFSET + RISC0_SELECTOR_LEN;
-const VERIFIER_ENTRY_ESTOPPED_OFFSET: usize = VERIFIER_ENTRY_VERIFIER_OFFSET + 32;
+const VERIFIER_ENTRY_VERIFIER_OFFSET: usize = 12;
+const VERIFIER_ENTRY_ESTOPPED_OFFSET: usize = 44;
 
 const TRUSTED_RISC0_SELECTOR: [u8; RISC0_SELECTOR_LEN] = [0x52, 0x5a, 0x56, 0x4d];
 const TRUSTED_RISC0_ROUTER_PROGRAM_ID: Pubkey =
@@ -196,162 +192,36 @@ pub struct CompleteTaskPrivate<'info> {
 }
 
 pub fn complete_task_private(
-    ctx: Context<CompleteTaskPrivate>,
+    mut ctx: Context<CompleteTaskPrivate>,
     task_id: u64,
     proof: PrivateCompletionPayload,
 ) -> Result<()> {
     let clock = Clock::get()?;
+    let task_key = ctx.accounts.task.key();
+    let decoded_proof = verify_private_completion_stage(&ctx, &task_key, task_id, &proof, &clock)?;
+    settle_private_completion(&mut ctx, &decoded_proof, &clock)
+}
 
-    let task = &ctx.accounts.task;
-    let claim = &ctx.accounts.claim;
-
-    let task_id_bytes: [u8; 8] = task.task_id[..8]
-        .try_into()
-        .map_err(|_| error!(CoordinationError::CorruptedData))?;
-    let expected_task_id = u64::from_le_bytes(task_id_bytes);
-    require!(task_id == expected_task_id, CoordinationError::TaskNotFound);
-
-    require!(
-        task.deadline == 0 || clock.unix_timestamp <= task.deadline,
-        CoordinationError::DeadlinePassed
+#[inline(never)]
+fn settle_private_completion(
+    ctx: &mut Context<CompleteTaskPrivate>,
+    decoded_proof: &DecodedPrivateProof,
+    clock: &Clock,
+) -> Result<()> {
+    record_private_spends(
+        ctx.accounts,
+        &decoded_proof.parsed_journal,
+        clock,
+        ctx.bumps.binding_spend,
+        ctx.bumps.nullifier_spend,
     );
-
-    check_version_compatible(&ctx.accounts.protocol_config)?;
-    validate_task_dependency(task, ctx.remaining_accounts, ctx.program_id)?;
-    validate_completion_prereqs(task, claim, &clock)?;
-
-    require!(
-        task.constraint_hash != [0u8; HASH_SIZE],
-        CoordinationError::NotPrivateTask
-    );
-
-    let decoded_seal = decode_and_validate_seal(&proof.seal_bytes)?;
-    let parsed_journal = parse_and_validate_journal(&proof.journal)?;
-
-    require!(
-        parsed_journal.task_pda == task.key().to_bytes(),
-        CoordinationError::InvalidJournalTask
-    );
-    require!(
-        parsed_journal.agent_authority == ctx.accounts.authority.key().to_bytes(),
-        CoordinationError::InvalidJournalAuthority
-    );
-    require!(
-        parsed_journal.constraint_hash == task.constraint_hash,
-        CoordinationError::ConstraintHashMismatch
-    );
-    require!(
-        parsed_journal.binding == proof.binding_seed,
-        CoordinationError::InvalidJournalBinding
-    );
-    require!(
-        parsed_journal.nullifier == proof.nullifier_seed,
-        CoordinationError::InvalidNullifier
-    );
-    require!(
-        proof.image_id == TRUSTED_RISC0_IMAGE_ID,
-        CoordinationError::InvalidImageId
-    );
-
-    validate_verifier_entry(&ctx.accounts.verifier_entry, &ctx.accounts.verifier_program)?;
-
-    let journal_digest = hashv(&[proof.journal.as_slice()]).to_bytes();
-    verify_with_router_cpi(&ctx, decoded_seal, proof.image_id, journal_digest)?;
-
-    let binding_spend = &mut ctx.accounts.binding_spend;
-    binding_spend.binding = parsed_journal.binding;
-    binding_spend.task = task.key();
-    binding_spend.agent = ctx.accounts.worker.key();
-    binding_spend.spent_at = clock.unix_timestamp;
-    binding_spend.bump = ctx.bumps.binding_spend;
-
-    let nullifier_spend = &mut ctx.accounts.nullifier_spend;
-    nullifier_spend.nullifier = parsed_journal.nullifier;
-    nullifier_spend.task = task.key();
-    nullifier_spend.agent = ctx.accounts.worker.key();
-    nullifier_spend.spent_at = clock.unix_timestamp;
-    nullifier_spend.bump = ctx.bumps.nullifier_spend;
-
-    let task = &mut ctx.accounts.task;
-    let claim = &mut ctx.accounts.claim;
-    let escrow = &mut ctx.accounts.escrow;
-    let worker = &mut ctx.accounts.worker;
-
-    let token_accounts = if task.reward_mint.is_some() {
-        let mint = match ctx.accounts.reward_mint.as_ref() {
-            Some(value) => value,
-            None => return err!(CoordinationError::MissingTokenAccounts),
-        };
-        let token_escrow = match ctx.accounts.token_escrow_ata.as_ref() {
-            Some(value) => value,
-            None => return err!(CoordinationError::MissingTokenAccounts),
-        };
-        let worker_token_account = match ctx.accounts.worker_token_account.as_ref() {
-            Some(value) => value,
-            None => return err!(CoordinationError::MissingTokenAccounts),
-        };
-        let treasury_ta = match ctx.accounts.treasury_token_account.as_ref() {
-            Some(value) => value,
-            None => return err!(CoordinationError::MissingTokenAccounts),
-        };
-        let token_program = match ctx.accounts.token_program.as_ref() {
-            Some(value) => value,
-            None => return err!(CoordinationError::MissingTokenAccounts),
-        };
-
-        require!(
-            mint.key() == task.reward_mint.unwrap_or_default(),
-            CoordinationError::InvalidTokenMint
-        );
-
-        validate_token_account(token_escrow, &mint.key(), &escrow.key())?;
-        validate_token_account(
-            treasury_ta,
-            &mint.key(),
-            &ctx.accounts.protocol_config.treasury,
-        )?;
-        validate_unchecked_token_mint(
-            &worker_token_account.to_account_info(),
-            &mint.key(),
-            &ctx.accounts.authority.key(),
-        )?;
-
-        Some(TokenPaymentAccounts {
-            token_escrow_ata: token_escrow.to_account_info(),
-            worker_token_account: worker_token_account.to_account_info(),
-            treasury_token_account: treasury_ta.to_account_info(),
-            token_program: token_program.to_account_info(),
-            escrow_authority: escrow.to_account_info(),
-            escrow_bump: escrow.bump,
-            task_key: task.key(),
-        })
-    } else {
-        None
-    };
-
-    claim.proof_hash = parsed_journal.output_commitment;
-    claim.result_data = [0u8; RESULT_DATA_SIZE];
-    claim.is_completed = true;
-    claim.completed_at = clock.unix_timestamp;
-
-    let protocol_fee_bps = calculate_fee_with_reputation(task.protocol_fee_bps, worker.reputation);
-
-    execute_completion_rewards(
-        task,
-        claim,
-        escrow,
-        worker,
-        &mut ctx.accounts.protocol_config,
-        &ctx.accounts.authority.to_account_info(),
-        &ctx.accounts.treasury.to_account_info(),
-        &ctx.accounts.creator.to_account_info(),
-        protocol_fee_bps,
-        None,
-        &clock,
+    let token_accounts = build_token_payment_accounts(ctx.accounts)?;
+    finalize_private_completion(
+        ctx.accounts,
+        decoded_proof.parsed_journal.output_commitment,
+        clock,
         token_accounts,
-    )?;
-
-    Ok(())
+    )
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
@@ -384,21 +254,406 @@ struct ParsedJournal {
     nullifier: [u8; HASH_SIZE],
 }
 
-fn decode_and_validate_seal(seal_bytes: &[u8]) -> Result<Risc0Seal> {
+#[derive(Clone, Debug)]
+struct DecodedPrivateProof {
+    seal: Risc0Seal,
+    parsed_journal: ParsedJournal,
+    journal_digest: [u8; HASH_SIZE],
+}
+
+#[inline(never)]
+fn verify_private_completion_stage(
+    ctx: &Context<CompleteTaskPrivate>,
+    task_key: &Pubkey,
+    task_id: u64,
+    proof: &PrivateCompletionPayload,
+    clock: &Clock,
+) -> Result<DecodedPrivateProof> {
+    let decoded_proof = decode_private_completion_payload(proof)?;
+    validate_completion_inputs(
+        &ctx.accounts.task,
+        task_key,
+        &ctx.accounts.claim,
+        &ctx.accounts.protocol_config,
+        ctx.remaining_accounts,
+        ctx.program_id,
+        &ctx.accounts.authority.key(),
+        task_id,
+        proof,
+        &decoded_proof.parsed_journal,
+        clock,
+    )?;
+    invoke_router_verification(ctx.accounts, proof, &decoded_proof)?;
+    Ok(decoded_proof)
+}
+
+#[inline(never)]
+fn decode_private_completion_payload(
+    proof: &PrivateCompletionPayload,
+) -> Result<DecodedPrivateProof> {
     require!(
-        seal_bytes.len() == RISC0_SEAL_BORSH_LEN,
+        proof.seal_bytes.len() == RISC0_SEAL_BORSH_LEN,
         CoordinationError::InvalidSealEncoding
     );
-
-    let seal = Risc0Seal::try_from_slice(seal_bytes)
+    let seal = crate::utils::borsh::try_from_slice_non_zst::<Risc0Seal>(&proof.seal_bytes)
         .map_err(|_| error!(CoordinationError::InvalidSealEncoding))?;
-
     require!(
         seal.selector == TRUSTED_RISC0_SELECTOR,
         CoordinationError::TrustedSelectorMismatch
     );
 
-    Ok(seal)
+    let parsed_journal = parse_and_validate_journal(&proof.journal)?;
+    let journal_digest = hashv(&[proof.journal.as_slice()]).to_bytes();
+
+    Ok(DecodedPrivateProof {
+        seal,
+        parsed_journal,
+        journal_digest,
+    })
+}
+
+#[inline(never)]
+fn validate_completion_inputs<'info>(
+    task: &Task,
+    task_key: &Pubkey,
+    claim: &TaskClaim,
+    protocol_config: &ProtocolConfig,
+    remaining_accounts: &[AccountInfo<'info>],
+    program_id: &Pubkey,
+    authority: &Pubkey,
+    task_id: u64,
+    proof: &PrivateCompletionPayload,
+    parsed_journal: &ParsedJournal,
+    clock: &Clock,
+) -> Result<()> {
+    validate_task_id(task, task_id)?;
+    require!(
+        task.deadline == 0 || clock.unix_timestamp <= task.deadline,
+        CoordinationError::DeadlinePassed
+    );
+
+    check_version_compatible(protocol_config)?;
+    validate_task_dependency(task, remaining_accounts, program_id)?;
+    validate_completion_prereqs(task, claim, clock)?;
+
+    require!(
+        task.constraint_hash != [0u8; HASH_SIZE],
+        CoordinationError::NotPrivateTask
+    );
+    validate_parsed_journal(task, task_key, authority, proof, parsed_journal)?;
+
+    Ok(())
+}
+
+fn validate_task_id(task: &Task, task_id: u64) -> Result<()> {
+    let task_id_bytes: [u8; 8] = task.task_id[..8]
+        .try_into()
+        .map_err(|_| error!(CoordinationError::CorruptedData))?;
+    let expected_task_id = u64::from_le_bytes(task_id_bytes);
+    require!(task_id == expected_task_id, CoordinationError::TaskNotFound);
+    Ok(())
+}
+
+fn validate_parsed_journal(
+    task: &Task,
+    task_key: &Pubkey,
+    authority: &Pubkey,
+    proof: &PrivateCompletionPayload,
+    parsed_journal: &ParsedJournal,
+) -> Result<()> {
+    require!(
+        parsed_journal.task_pda == task_key.to_bytes(),
+        CoordinationError::InvalidJournalTask
+    );
+    require!(
+        parsed_journal.agent_authority == authority.to_bytes(),
+        CoordinationError::InvalidJournalAuthority
+    );
+    require!(
+        parsed_journal.constraint_hash == task.constraint_hash,
+        CoordinationError::ConstraintHashMismatch
+    );
+    require!(
+        parsed_journal.binding == proof.binding_seed,
+        CoordinationError::InvalidJournalBinding
+    );
+    require!(
+        parsed_journal.nullifier == proof.nullifier_seed,
+        CoordinationError::InvalidNullifier
+    );
+    require!(
+        proof.image_id == TRUSTED_RISC0_IMAGE_ID,
+        CoordinationError::InvalidImageId
+    );
+    Ok(())
+}
+
+#[inline(never)]
+fn invoke_router_verification<'info>(
+    accounts: &CompleteTaskPrivate<'info>,
+    proof: &PrivateCompletionPayload,
+    decoded_proof: &DecodedPrivateProof,
+) -> Result<()> {
+    validate_verifier_entry(&accounts.verifier_entry, &accounts.verifier_program)?;
+    let router_program_key = validate_router_program_accounts(accounts)?;
+    let verify_ix =
+        build_and_validate_router_verify_ix(accounts, proof, decoded_proof, &router_program_key)?;
+    invoke_router_verify_ix(accounts, &verify_ix)
+}
+
+fn validate_router_program_accounts<'info>(
+    accounts: &CompleteTaskPrivate<'info>,
+) -> Result<Pubkey> {
+    let router_program_key = accounts.router_program.key();
+    require!(
+        router_program_key == TRUSTED_RISC0_ROUTER_PROGRAM_ID,
+        CoordinationError::RouterAccountMismatch
+    );
+    require!(
+        accounts.verifier_program.key() == TRUSTED_RISC0_VERIFIER_PROGRAM_ID,
+        CoordinationError::TrustedVerifierProgramMismatch
+    );
+    Ok(router_program_key)
+}
+
+fn build_and_validate_router_verify_ix<'info>(
+    accounts: &CompleteTaskPrivate<'info>,
+    proof: &PrivateCompletionPayload,
+    decoded_proof: &DecodedPrivateProof,
+    router_program_key: &Pubkey,
+) -> Result<Instruction> {
+    let verify_ix = build_router_verify_ix(
+        router_program_key,
+        &accounts.router.key(),
+        &accounts.verifier_entry.key(),
+        &accounts.verifier_program.key(),
+        &accounts.system_program.key(),
+        &decoded_proof.seal,
+        proof.image_id,
+        decoded_proof.journal_digest,
+    )?;
+    validate_router_verify_ix(
+        &verify_ix,
+        &accounts.router.key(),
+        &accounts.verifier_entry.key(),
+        &accounts.verifier_program.key(),
+        &accounts.system_program.key(),
+    )?;
+    Ok(verify_ix)
+}
+
+fn invoke_router_verify_ix<'info>(
+    accounts: &CompleteTaskPrivate<'info>,
+    verify_ix: &Instruction,
+) -> Result<()> {
+    invoke(
+        verify_ix,
+        &[
+            accounts.router.to_account_info(),
+            accounts.verifier_entry.to_account_info(),
+            accounts.verifier_program.to_account_info(),
+            accounts.system_program.to_account_info(),
+            accounts.router_program.to_account_info(),
+        ],
+    )
+    .map_err(|err| {
+        msg!("router verification CPI failed: {:?}", err);
+        error!(CoordinationError::ZkVerificationFailed)
+    })?;
+    Ok(())
+}
+
+fn build_router_verify_ix(
+    router_program_key: &Pubkey,
+    router: &Pubkey,
+    verifier_entry: &Pubkey,
+    verifier_program: &Pubkey,
+    system_program: &Pubkey,
+    seal: &Risc0Seal,
+    image_id: [u8; RISC0_IMAGE_ID_LEN],
+    journal_digest: [u8; HASH_SIZE],
+) -> Result<Instruction> {
+    let mut cpi_data = Vec::with_capacity(332);
+    cpi_data.extend_from_slice(&ROUTER_VERIFY_IX_DISCRIMINATOR);
+    RouterVerifyArgs {
+        seal: seal.clone(),
+        image_id,
+        journal_digest,
+    }
+    .serialize(&mut cpi_data)
+    .map_err(|_| error!(CoordinationError::InvalidSealEncoding))?;
+
+    Ok(Instruction {
+        program_id: *router_program_key,
+        accounts: vec![
+            AccountMeta::new_readonly(*router, false),
+            AccountMeta::new_readonly(*verifier_entry, false),
+            AccountMeta::new_readonly(*verifier_program, false),
+            AccountMeta::new_readonly(*system_program, false),
+        ],
+        data: cpi_data,
+    })
+}
+
+fn record_private_spends<'info>(
+    accounts: &mut CompleteTaskPrivate<'info>,
+    parsed_journal: &ParsedJournal,
+    clock: &Clock,
+    binding_spend_bump: u8,
+    nullifier_spend_bump: u8,
+) {
+    let task_key = accounts.task.key();
+    let worker_key = accounts.worker.key();
+
+    let binding_spend = &mut accounts.binding_spend;
+    binding_spend.binding = parsed_journal.binding;
+    binding_spend.task = task_key;
+    binding_spend.agent = worker_key;
+    binding_spend.spent_at = clock.unix_timestamp;
+    binding_spend.bump = binding_spend_bump;
+
+    let nullifier_spend = &mut accounts.nullifier_spend;
+    nullifier_spend.nullifier = parsed_journal.nullifier;
+    nullifier_spend.task = task_key;
+    nullifier_spend.agent = worker_key;
+    nullifier_spend.spent_at = clock.unix_timestamp;
+    nullifier_spend.bump = nullifier_spend_bump;
+}
+
+#[inline(never)]
+fn finalize_private_completion<'info>(
+    accounts: &mut CompleteTaskPrivate<'info>,
+    output_commitment: [u8; HASH_SIZE],
+    clock: &Clock,
+    token_accounts: Option<TokenPaymentAccounts<'info>>,
+) -> Result<()> {
+    let task = &mut accounts.task;
+    let claim = &mut accounts.claim;
+    let escrow = &mut accounts.escrow;
+    let worker = &mut accounts.worker;
+
+    claim.proof_hash = output_commitment;
+    claim.result_data = [0u8; RESULT_DATA_SIZE];
+    claim.is_completed = true;
+    claim.completed_at = clock.unix_timestamp;
+
+    let protocol_fee_bps = calculate_fee_with_reputation(task.protocol_fee_bps, worker.reputation);
+    execute_completion_rewards(
+        task,
+        claim,
+        escrow,
+        worker,
+        &mut accounts.protocol_config,
+        &accounts.authority.to_account_info(),
+        &accounts.treasury.to_account_info(),
+        &accounts.creator.to_account_info(),
+        protocol_fee_bps,
+        None,
+        clock,
+        token_accounts,
+    )
+}
+
+#[inline(never)]
+fn build_token_payment_accounts<'info>(
+    accounts: &CompleteTaskPrivate<'info>,
+) -> Result<Option<TokenPaymentAccounts<'info>>> {
+    let task = &accounts.task;
+    if task.reward_mint.is_none() {
+        return Ok(None);
+    }
+
+    let required_accounts = extract_required_token_accounts(accounts)?;
+    let token_payment_accounts =
+        build_validated_token_payment_accounts(accounts, required_accounts)?;
+    Ok(Some(token_payment_accounts))
+}
+
+struct RequiredTokenAccounts<'a, 'info> {
+    mint: &'a Account<'info, Mint>,
+    token_escrow: &'a Account<'info, TokenAccount>,
+    worker_token_account: &'a UncheckedAccount<'info>,
+    treasury_ta: &'a Account<'info, TokenAccount>,
+    token_program: &'a Program<'info, Token>,
+    expected_mint: Pubkey,
+}
+
+fn extract_required_token_accounts<'a, 'info>(
+    accounts: &'a CompleteTaskPrivate<'info>,
+) -> Result<RequiredTokenAccounts<'a, 'info>> {
+    let mint = accounts
+        .reward_mint
+        .as_ref()
+        .ok_or(CoordinationError::MissingTokenAccounts)?;
+    let token_escrow = accounts
+        .token_escrow_ata
+        .as_ref()
+        .ok_or(CoordinationError::MissingTokenAccounts)?;
+    let worker_token_account = accounts
+        .worker_token_account
+        .as_ref()
+        .ok_or(CoordinationError::MissingTokenAccounts)?;
+    let treasury_ta = accounts
+        .treasury_token_account
+        .as_ref()
+        .ok_or(CoordinationError::MissingTokenAccounts)?;
+    let token_program = accounts
+        .token_program
+        .as_ref()
+        .ok_or(CoordinationError::MissingTokenAccounts)?;
+    let expected_mint = accounts
+        .task
+        .reward_mint
+        .ok_or(CoordinationError::InvalidTokenMint)?;
+
+    Ok(RequiredTokenAccounts {
+        mint,
+        token_escrow,
+        worker_token_account,
+        treasury_ta,
+        token_program,
+        expected_mint,
+    })
+}
+
+fn build_validated_token_payment_accounts<'a, 'info>(
+    accounts: &'a CompleteTaskPrivate<'info>,
+    required_accounts: RequiredTokenAccounts<'a, 'info>,
+) -> Result<TokenPaymentAccounts<'info>> {
+    let RequiredTokenAccounts {
+        mint,
+        token_escrow,
+        worker_token_account,
+        treasury_ta,
+        token_program,
+        expected_mint,
+    } = required_accounts;
+
+    require!(
+        mint.key() == expected_mint,
+        CoordinationError::InvalidTokenMint
+    );
+    validate_token_account(token_escrow, &mint.key(), &accounts.escrow.key())?;
+    validate_token_account(treasury_ta, &mint.key(), &accounts.protocol_config.treasury)?;
+    let token_escrow_starting_amount =
+        anchor_spl::token::accessor::amount(&token_escrow.to_account_info())
+            .map_err(|_| CoordinationError::TokenTransferFailed)?;
+    validate_unchecked_token_mint(
+        &worker_token_account.to_account_info(),
+        &mint.key(),
+        &accounts.authority.key(),
+    )?;
+
+    Ok(TokenPaymentAccounts {
+        token_escrow_ata: token_escrow.to_account_info(),
+        token_escrow_starting_amount,
+        worker_token_account: worker_token_account.to_account_info(),
+        treasury_token_account: treasury_ta.to_account_info(),
+        token_program: token_program.to_account_info(),
+        escrow_authority: accounts.escrow.to_account_info(),
+        escrow_bump: accounts.escrow.bump,
+        task_key: accounts.task.key(),
+    })
 }
 
 fn parse_and_validate_journal(journal: &[u8]) -> Result<ParsedJournal> {
@@ -492,12 +747,49 @@ fn validate_verifier_entry(
     validate_verifier_entry_data(data.as_ref(), &verifier_program.key())
 }
 
+fn validate_router_verify_ix(
+    verify_ix: &Instruction,
+    router: &Pubkey,
+    verifier_entry: &Pubkey,
+    verifier_program: &Pubkey,
+    system_program: &Pubkey,
+) -> Result<()> {
+    require!(
+        verify_ix.program_id == TRUSTED_RISC0_ROUTER_PROGRAM_ID,
+        CoordinationError::RouterAccountMismatch
+    );
+    require!(
+        verify_ix.accounts.len() == 4,
+        CoordinationError::RouterAccountMismatch
+    );
+
+    let expected_keys = [*router, *verifier_entry, *verifier_program, *system_program];
+    for (meta, expected_key) in verify_ix.accounts.iter().zip(expected_keys.iter()) {
+        require!(
+            meta.pubkey == *expected_key,
+            CoordinationError::RouterAccountMismatch
+        );
+        require!(!meta.is_signer, CoordinationError::RouterAccountMismatch);
+        require!(!meta.is_writable, CoordinationError::RouterAccountMismatch);
+    }
+
+    Ok(())
+}
+
 fn validate_verifier_entry_data(data: &[u8], verifier_program_key: &Pubkey) -> Result<()> {
     require!(
         data.len() == VERIFIER_ENTRY_ACCOUNT_LEN,
         CoordinationError::RouterAccountMismatch
     );
+    validate_verifier_entry_discriminator(data)?;
+    validate_verifier_entry_selector(data)?;
+    validate_verifier_program_binding(data, verifier_program_key)?;
+    validate_verifier_entry_not_estopped(data)?;
 
+    Ok(())
+}
+
+fn validate_verifier_entry_discriminator(data: &[u8]) -> Result<()> {
     let discriminator = data
         .get(0..8)
         .ok_or(error!(CoordinationError::RouterAccountMismatch))?;
@@ -505,7 +797,10 @@ fn validate_verifier_entry_data(data: &[u8], verifier_program_key: &Pubkey) -> R
         discriminator == VERIFIER_ENTRY_DISCRIMINATOR.as_ref(),
         CoordinationError::RouterAccountMismatch
     );
+    Ok(())
+}
 
+fn validate_verifier_entry_selector(data: &[u8]) -> Result<()> {
     let selector_slice = data
         .get(VERIFIER_ENTRY_SELECTOR_OFFSET..VERIFIER_ENTRY_VERIFIER_OFFSET)
         .ok_or(error!(CoordinationError::RouterAccountMismatch))?;
@@ -515,15 +810,11 @@ fn validate_verifier_entry_data(data: &[u8], verifier_program_key: &Pubkey) -> R
         selector == TRUSTED_RISC0_SELECTOR,
         CoordinationError::TrustedSelectorMismatch
     );
+    Ok(())
+}
 
-    let verifier_slice = data
-        .get(VERIFIER_ENTRY_VERIFIER_OFFSET..VERIFIER_ENTRY_ESTOPPED_OFFSET)
-        .ok_or(error!(CoordinationError::RouterAccountMismatch))?;
-    let verifier_pubkey = Pubkey::new_from_array(
-        verifier_slice
-            .try_into()
-            .map_err(|_| error!(CoordinationError::RouterAccountMismatch))?,
-    );
+fn validate_verifier_program_binding(data: &[u8], verifier_program_key: &Pubkey) -> Result<()> {
+    let verifier_pubkey = parse_verifier_entry_program(data)?;
     require!(
         verifier_pubkey == TRUSTED_RISC0_VERIFIER_PROGRAM_ID,
         CoordinationError::TrustedVerifierProgramMismatch
@@ -532,56 +823,24 @@ fn validate_verifier_entry_data(data: &[u8], verifier_program_key: &Pubkey) -> R
         verifier_pubkey == *verifier_program_key,
         CoordinationError::TrustedVerifierProgramMismatch
     );
+    Ok(())
+}
 
+fn parse_verifier_entry_program(data: &[u8]) -> Result<Pubkey> {
+    let verifier_slice = data
+        .get(VERIFIER_ENTRY_VERIFIER_OFFSET..VERIFIER_ENTRY_ESTOPPED_OFFSET)
+        .ok_or(error!(CoordinationError::RouterAccountMismatch))?;
+    let verifier_bytes: [u8; 32] = verifier_slice
+        .try_into()
+        .map_err(|_| error!(CoordinationError::RouterAccountMismatch))?;
+    Ok(Pubkey::new_from_array(verifier_bytes))
+}
+
+fn validate_verifier_entry_not_estopped(data: &[u8]) -> Result<()> {
     let estopped = data
         .get(VERIFIER_ENTRY_ESTOPPED_OFFSET)
         .ok_or(error!(CoordinationError::RouterAccountMismatch))?;
     require!(*estopped == 0, CoordinationError::RouterAccountMismatch);
-
-    Ok(())
-}
-
-fn verify_with_router_cpi(
-    ctx: &Context<CompleteTaskPrivate>,
-    seal: Risc0Seal,
-    image_id: [u8; RISC0_IMAGE_ID_LEN],
-    journal_digest: [u8; HASH_SIZE],
-) -> Result<()> {
-    let mut data = Vec::with_capacity(8 + RISC0_SEAL_BORSH_LEN + RISC0_IMAGE_ID_LEN + HASH_SIZE);
-    data.extend_from_slice(&ROUTER_VERIFY_IX_DISCRIMINATOR);
-    RouterVerifyArgs {
-        seal,
-        image_id,
-        journal_digest,
-    }
-    .serialize(&mut data)
-    .map_err(|_| error!(CoordinationError::InvalidSealEncoding))?;
-
-    let ix = Instruction {
-        program_id: ctx.accounts.router_program.key(),
-        accounts: vec![
-            AccountMeta::new_readonly(ctx.accounts.router.key(), false),
-            AccountMeta::new_readonly(ctx.accounts.verifier_entry.key(), false),
-            AccountMeta::new_readonly(ctx.accounts.verifier_program.key(), false),
-            AccountMeta::new_readonly(ctx.accounts.system_program.key(), false),
-        ],
-        data,
-    };
-
-    invoke(
-        &ix,
-        &[
-            ctx.accounts.router.to_account_info(),
-            ctx.accounts.verifier_entry.to_account_info(),
-            ctx.accounts.verifier_program.to_account_info(),
-            ctx.accounts.system_program.to_account_info(),
-        ],
-    )
-    .map_err(|err| {
-        msg!("router verification CPI failed: {:?}", err);
-        error!(CoordinationError::ZkVerificationFailed)
-    })?;
-
     Ok(())
 }
 
@@ -595,19 +854,6 @@ mod tests {
             message.contains(name),
             "expected error containing '{name}', got '{message}'"
         );
-    }
-
-    fn sample_seal_bytes(selector: [u8; 4]) -> Vec<u8> {
-        Risc0Seal {
-            selector,
-            proof: Risc0Groth16Proof {
-                pi_a: [1u8; 64],
-                pi_b: [2u8; 128],
-                pi_c: [3u8; 64],
-            },
-        }
-        .try_to_vec()
-        .expect("test seal serialization")
     }
 
     fn sample_journal(
@@ -640,7 +886,8 @@ mod tests {
 
     #[test]
     fn journal_rejects_invalid_length() {
-        let err = parse_and_validate_journal(&[0u8; RISC0_JOURNAL_LEN - 1]).expect_err("must fail");
+        let err = parse_and_validate_journal(&[0u8; RISC0_JOURNAL_LEN.saturating_sub(1)])
+            .expect_err("must fail");
         assert_error_name(err, "InvalidJournalLength");
     }
 
@@ -674,21 +921,6 @@ mod tests {
     }
 
     #[test]
-    fn seal_decode_rejects_invalid_encoding() {
-        let err = decode_and_validate_seal(&[7u8; 12]).expect_err("must fail");
-        assert_error_name(err, "InvalidSealEncoding");
-    }
-
-    #[test]
-    fn seal_decode_rejects_untrusted_selector() {
-        let mut selector = TRUSTED_RISC0_SELECTOR;
-        selector[0] ^= 1;
-        let seal = sample_seal_bytes(selector);
-        let err = decode_and_validate_seal(&seal).expect_err("must fail");
-        assert_error_name(err, "TrustedSelectorMismatch");
-    }
-
-    #[test]
     fn verifier_entry_rejects_bad_length() {
         let err = validate_verifier_entry_data(&[0u8; 7], &TRUSTED_RISC0_VERIFIER_PROGRAM_ID)
             .expect_err("must fail");
@@ -719,6 +951,100 @@ mod tests {
             verifier_entry_bytes(TRUSTED_RISC0_SELECTOR, TRUSTED_RISC0_VERIFIER_PROGRAM_ID, 1);
         let err = validate_verifier_entry_data(&data, &TRUSTED_RISC0_VERIFIER_PROGRAM_ID)
             .expect_err("must fail");
+        assert_error_name(err, "RouterAccountMismatch");
+    }
+
+    fn sample_router_ix(
+        program_id: Pubkey,
+        router: Pubkey,
+        verifier_entry: Pubkey,
+        verifier_program: Pubkey,
+        system_program: Pubkey,
+    ) -> Instruction {
+        Instruction {
+            program_id,
+            accounts: vec![
+                AccountMeta::new_readonly(router, false),
+                AccountMeta::new_readonly(verifier_entry, false),
+                AccountMeta::new_readonly(verifier_program, false),
+                AccountMeta::new_readonly(system_program, false),
+            ],
+            data: vec![],
+        }
+    }
+
+    #[test]
+    fn router_verify_ix_accepts_expected_shape() {
+        let router = Pubkey::new_unique();
+        let verifier_entry = Pubkey::new_unique();
+        let verifier_program = Pubkey::new_unique();
+        let system_program = anchor_lang::system_program::ID;
+        let ix = sample_router_ix(
+            TRUSTED_RISC0_ROUTER_PROGRAM_ID,
+            router,
+            verifier_entry,
+            verifier_program,
+            system_program,
+        );
+
+        validate_router_verify_ix(
+            &ix,
+            &router,
+            &verifier_entry,
+            &verifier_program,
+            &system_program,
+        )
+        .expect("must pass");
+    }
+
+    #[test]
+    fn router_verify_ix_rejects_wrong_program_id() {
+        let router = Pubkey::new_unique();
+        let verifier_entry = Pubkey::new_unique();
+        let verifier_program = Pubkey::new_unique();
+        let system_program = anchor_lang::system_program::ID;
+        let ix = sample_router_ix(
+            Pubkey::new_unique(),
+            router,
+            verifier_entry,
+            verifier_program,
+            system_program,
+        );
+
+        let err = validate_router_verify_ix(
+            &ix,
+            &router,
+            &verifier_entry,
+            &verifier_program,
+            &system_program,
+        )
+        .expect_err("must fail");
+        assert_error_name(err, "RouterAccountMismatch");
+    }
+
+    #[test]
+    fn router_verify_ix_rejects_writable_meta() {
+        let router = Pubkey::new_unique();
+        let verifier_entry = Pubkey::new_unique();
+        let verifier_program = Pubkey::new_unique();
+        let system_program = anchor_lang::system_program::ID;
+        let mut ix = sample_router_ix(
+            TRUSTED_RISC0_ROUTER_PROGRAM_ID,
+            router,
+            verifier_entry,
+            verifier_program,
+            system_program,
+        );
+        ix.accounts[0] = AccountMeta::new(router, false);
+
+        let err = validate_router_verify_ix(
+            &ix,
+            &router,
+            &verifier_entry,
+            &verifier_program,
+            &system_program,
+        )
+        .expect_err("must fail");
         assert_error_name(err, "RouterAccountMismatch");
     }
 
