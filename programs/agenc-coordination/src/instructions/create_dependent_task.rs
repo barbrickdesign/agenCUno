@@ -157,29 +157,68 @@ pub fn handler(
             CoordinationError::MissingTokenAccounts
         );
 
-        let mint = ctx.accounts.reward_mint.as_ref().unwrap();
-        let creator_ta = ctx.accounts.creator_token_account.as_ref().unwrap();
-        let token_escrow_ata = ctx.accounts.token_escrow_ata.as_ref().unwrap();
-        let token_program = ctx.accounts.token_program.as_ref().unwrap();
-        let ata_program = ctx.accounts.associated_token_program.as_ref().unwrap();
+        let mint = ctx
+            .accounts
+            .reward_mint
+            .as_ref()
+            .ok_or(CoordinationError::MissingTokenAccounts)?;
+        let creator_ta = ctx
+            .accounts
+            .creator_token_account
+            .as_ref()
+            .ok_or(CoordinationError::MissingTokenAccounts)?;
+        let token_escrow_ata = ctx
+            .accounts
+            .token_escrow_ata
+            .as_ref()
+            .ok_or(CoordinationError::MissingTokenAccounts)?;
+        let token_program = ctx
+            .accounts
+            .token_program
+            .as_ref()
+            .ok_or(CoordinationError::MissingTokenAccounts)?;
+        let ata_program = ctx
+            .accounts
+            .associated_token_program
+            .as_ref()
+            .ok_or(CoordinationError::MissingTokenAccounts)?;
 
         require!(
             mint.key() == expected_mint,
             CoordinationError::InvalidTokenMint
         );
 
-        // Create escrow ATA via CPI (payer = creator)
-        anchor_spl::associated_token::create(CpiContext::new(
-            ata_program.to_account_info(),
-            anchor_spl::associated_token::Create {
-                payer: ctx.accounts.creator.to_account_info(),
-                associated_token: token_escrow_ata.to_account_info(),
-                authority: ctx.accounts.escrow.to_account_info(),
-                mint: mint.to_account_info(),
-                system_program: ctx.accounts.system_program.to_account_info(),
-                token_program: token_program.to_account_info(),
-            },
-        ))?;
+        let token_escrow_info = token_escrow_ata.to_account_info();
+        if token_escrow_info.owner == &system_program::ID {
+            anchor_spl::associated_token::create(CpiContext::new(
+                ata_program.to_account_info(),
+                anchor_spl::associated_token::Create {
+                    payer: ctx.accounts.creator.to_account_info(),
+                    associated_token: token_escrow_info.clone(),
+                    authority: ctx.accounts.escrow.to_account_info(),
+                    mint: mint.to_account_info(),
+                    system_program: ctx.accounts.system_program.to_account_info(),
+                    token_program: token_program.to_account_info(),
+                },
+            ))?;
+        } else {
+            require!(
+                token_escrow_info.owner == token_program.key,
+                CoordinationError::InvalidTokenEscrow
+            );
+            let escrow_ata_mint = token::accessor::mint(&token_escrow_info)
+                .map_err(|_| CoordinationError::InvalidTokenEscrow)?;
+            require!(
+                escrow_ata_mint == mint.key(),
+                CoordinationError::InvalidTokenMint
+            );
+            let escrow_ata_authority = token::accessor::authority(&token_escrow_info)
+                .map_err(|_| CoordinationError::InvalidTokenEscrow)?;
+            require!(
+                escrow_ata_authority == ctx.accounts.escrow.key(),
+                CoordinationError::InvalidTokenEscrow
+            );
+        }
 
         // Transfer tokens from creator ATA to escrow ATA
         token::transfer(

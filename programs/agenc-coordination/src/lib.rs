@@ -215,7 +215,7 @@ pub mod agenc_coordination {
     /// Cancel an unclaimed or expired task and reclaim funds.
     pub fn cancel_task(ctx: Context<CancelTask>) -> Result<()> {
         require!(
-            ctx.accounts.creator.is_signer,
+            ctx.accounts.authority.is_signer,
             CoordinationError::UnauthorizedTaskAction
         );
         instructions::cancel_task::process_cancel_task(ctx)

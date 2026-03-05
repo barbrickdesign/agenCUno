@@ -16,7 +16,7 @@ use anchor_lang::system_program;
 const MAX_RATE_LIMIT: u64 = 1000;
 
 /// Maximum cooldown value: 1 week in seconds (matches update_rate_limits.rs)
-const MAX_COOLDOWN: i64 = 86400 * 7;
+const MAX_COOLDOWN: i64 = 604_800;
 
 /// Minimum dispute stake to prevent free dispute spam (matches update_rate_limits.rs)
 const MIN_DISPUTE_STAKE: u64 = 1000;
@@ -43,8 +43,8 @@ pub struct ExecuteProposal<'info> {
     )]
     pub governance_config: Box<Account<'info, GovernanceConfig>>,
 
-    /// Executor can be anyone (permissionless after voting ends)
-    pub executor: Signer<'info>,
+    /// Authority can be anyone (permissionless after voting ends)
+    pub authority: Signer<'info>,
 
     /// CHECK: Treasury account for TreasurySpend proposals.
     /// Must match protocol_config.treasury. Spend path supports:
@@ -68,6 +68,10 @@ pub fn handler(ctx: Context<ExecuteProposal>) -> Result<()> {
     let clock = Clock::get()?;
 
     check_version_compatible(config)?;
+    require!(
+        ctx.accounts.authority.is_signer,
+        CoordinationError::InvalidInput
+    );
 
     // Verify proposal is active
     require!(
@@ -258,15 +262,23 @@ fn execute_rate_limit_change(proposal: &Proposal, config: &mut ProtocolConfig) -
 
     // Validate bounds (same as update_rate_limits.rs)
     require!(
-        (0..=MAX_COOLDOWN).contains(&task_creation_cooldown),
+        (1..=MAX_COOLDOWN).contains(&task_creation_cooldown),
         CoordinationError::InvalidProposalPayload
     );
     require!(
-        (0..=MAX_COOLDOWN).contains(&dispute_initiation_cooldown),
+        (1..=MAX_COOLDOWN).contains(&dispute_initiation_cooldown),
+        CoordinationError::InvalidProposalPayload
+    );
+    require!(
+        max_tasks_per_24h >= 1,
         CoordinationError::InvalidProposalPayload
     );
     require!(
         (max_tasks_per_24h as u64) <= MAX_RATE_LIMIT,
+        CoordinationError::InvalidProposalPayload
+    );
+    require!(
+        max_disputes_per_24h >= 1,
         CoordinationError::InvalidProposalPayload
     );
     require!(

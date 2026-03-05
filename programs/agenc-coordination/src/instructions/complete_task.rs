@@ -156,12 +156,27 @@ pub fn handler(
             CoordinationError::MissingTokenAccounts
         );
 
-        let mint = ctx.accounts.reward_mint.as_ref().unwrap();
-        let token_escrow = ctx.accounts.token_escrow_ata.as_ref().unwrap();
-        let treasury_ta = ctx.accounts.treasury_token_account.as_ref().unwrap();
+        let mint = ctx
+            .accounts
+            .reward_mint
+            .as_ref()
+            .ok_or(CoordinationError::MissingTokenAccounts)?;
+        let token_escrow = ctx
+            .accounts
+            .token_escrow_ata
+            .as_ref()
+            .ok_or(CoordinationError::MissingTokenAccounts)?;
+        let treasury_ta = ctx
+            .accounts
+            .treasury_token_account
+            .as_ref()
+            .ok_or(CoordinationError::MissingTokenAccounts)?;
+        let expected_mint = task
+            .reward_mint
+            .ok_or(CoordinationError::InvalidTokenMint)?;
 
         require!(
-            mint.key() == task.reward_mint.unwrap(),
+            mint.key() == expected_mint,
             CoordinationError::InvalidTokenMint
         );
 
@@ -171,24 +186,28 @@ pub fn handler(
             &mint.key(),
             &ctx.accounts.protocol_config.treasury,
         )?;
+        let token_escrow_starting_amount =
+            anchor_spl::token::accessor::amount(&token_escrow.to_account_info())
+                .map_err(|_| CoordinationError::TokenTransferFailed)?;
 
         let worker_ta_info = ctx
             .accounts
             .worker_token_account
             .as_ref()
-            .unwrap()
+            .ok_or(CoordinationError::MissingTokenAccounts)?
             .to_account_info();
         validate_unchecked_token_mint(&worker_ta_info, &mint.key(), &ctx.accounts.authority.key())?;
 
         Some(TokenPaymentAccounts {
             token_escrow_ata: token_escrow.to_account_info(),
+            token_escrow_starting_amount,
             worker_token_account: worker_ta_info,
             treasury_token_account: treasury_ta.to_account_info(),
             token_program: ctx
                 .accounts
                 .token_program
                 .as_ref()
-                .unwrap()
+                .ok_or(CoordinationError::MissingTokenAccounts)?
                 .to_account_info(),
             escrow_authority: escrow.to_account_info(),
             escrow_bump: escrow.bump,
