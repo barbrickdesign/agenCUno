@@ -12,7 +12,7 @@ use anchor_lang::prelude::*;
 
 /// Window for applying slashing after dispute resolution (7 days).
 /// After this period, slashing can no longer be applied (fix #414).
-pub const SLASH_WINDOW: i64 = 7 * 24 * 60 * 60;
+pub const SLASH_WINDOW: i64 = 604_800;
 
 /// Validates that the slash window has not expired since dispute resolution.
 pub fn validate_slash_window(resolved_at: i64, clock: &Clock) -> Result<()> {
@@ -51,10 +51,7 @@ pub fn calculate_slash_amount(
     current_stake: u64,
     slash_percentage: u8,
 ) -> Result<u64> {
-    require!(
-        slash_percentage <= 100,
-        CoordinationError::InvalidInput
-    );
+    require!(slash_percentage <= 100, CoordinationError::InvalidInput);
 
     let slash_amount = stake_at_dispute
         .checked_mul(slash_percentage as u64)
