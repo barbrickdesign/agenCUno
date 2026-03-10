@@ -183,6 +183,107 @@ export {
 } from "./mutation-gates.js";
 
 export {
+  PIPELINE_QUALITY_ARTIFACT_SCHEMA_VERSION,
+  buildPipelineQualityArtifact,
+  parsePipelineQualityArtifact,
+  serializePipelineQualityArtifact,
+  type PipelineContextGrowthArtifact,
+  type PipelineToolTurnArtifact,
+  type PipelineDesktopRunArtifact,
+  type PipelineDesktopStabilityArtifact,
+  type PipelineTokenEfficiencyArtifact,
+  type PipelineOfflineReplayFixtureArtifact,
+  type PipelineOfflineReplayArtifact,
+  type PipelineDelegationScenarioMode,
+  type PipelineDelegationScenarioArtifact,
+  type PipelineDelegationArtifact,
+  type PipelineQualityArtifact,
+  type PipelineContextGrowthInput,
+  type PipelineToolTurnInput,
+  type PipelineDesktopStabilityInput,
+  type PipelineTokenEfficiencyInput,
+  type PipelineOfflineReplayInput,
+  type PipelineDelegationScenarioInput,
+  type PipelineDelegationInput,
+  type PipelineQualityArtifactInput,
+} from "./pipeline-quality.js";
+
+export {
+  DEFAULT_PIPELINE_QUALITY_GATE_THRESHOLDS,
+  evaluatePipelineQualityGates,
+  formatPipelineQualityGateEvaluation,
+  type PipelineQualityGateThresholds,
+  type PipelineGateViolation,
+  type PipelineGateEvaluation,
+} from "./pipeline-gates.js";
+
+export {
+  runPipelineHttpRepro,
+  type PipelineHttpReproStepResult,
+  type PipelineHttpReproResult,
+  type PipelineHttpReproOptions,
+} from "./pipeline-http-repro.js";
+
+export {
+  runPipelineQualitySuite,
+  type PipelineDesktopRunnerInput,
+  type PipelineDesktopRunner,
+  type PipelineQualityRunnerConfig,
+} from "./pipeline-quality-runner.js";
+
+export {
+  DEFAULT_DELEGATION_BENCHMARK_K,
+  DELEGATION_BENCHMARK_CORPUS_VERSION,
+  DELEGATION_BENCHMARK_BASELINE_SCENARIO_ID,
+  buildDelegationBenchmarkManifest,
+  runDelegationBenchmarkSuite,
+  serializeDelegationBenchmarkSuiteResult,
+  type DelegationBenchmarkSummary,
+  type DelegationBenchmarkSuiteResult,
+  type DelegationBenchmarkSuiteConfig,
+} from "./delegation-benchmark.js";
+
+export {
+  searchDecompositionPolicies,
+  type DecompositionDagVariant,
+  type DecompositionReplayFixture,
+  type DecompositionSearchConfig,
+  type DecompositionVariantScore,
+  type DecompositionSearchResult,
+} from "./decomposition-search.js";
+
+export {
+  replayBackgroundRunFromStore,
+  type BackgroundRunReplayEvent,
+  type BackgroundRunReplayResult,
+} from "./background-run-replay.js";
+
+export {
+  BACKGROUND_RUN_QUALITY_ARTIFACT_SCHEMA_VERSION,
+  buildBackgroundRunQualityArtifact,
+  parseBackgroundRunQualityArtifact,
+  serializeBackgroundRunQualityArtifact,
+  type BackgroundRunScenarioCategory,
+  type BackgroundRunScenarioArtifact,
+  type BackgroundRunQualityArtifact,
+  type BackgroundRunQualityArtifactInput,
+} from "./background-run-quality.js";
+
+export {
+  DEFAULT_BACKGROUND_RUN_QUALITY_GATE_THRESHOLDS,
+  evaluateBackgroundRunQualityGates,
+  formatBackgroundRunGateEvaluation,
+  type BackgroundRunQualityGateThresholds,
+  type BackgroundRunGateViolation,
+  type BackgroundRunGateEvaluation,
+} from "./background-run-gates.js";
+
+export {
+  runBackgroundRunQualitySuite,
+  type BackgroundRunQualityRunnerConfig,
+} from "./background-run-quality-runner.js";
+
+export {
   computePassAtK,
   computePassCaretK,
   getRewardTier,

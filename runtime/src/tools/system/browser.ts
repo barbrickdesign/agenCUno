@@ -13,8 +13,19 @@ import type { Tool, ToolResult } from "../types.js";
 import { safeStringify } from "../types.js";
 import type { Logger } from "../../utils/logger.js";
 import { silentLogger } from "../../utils/logger.js";
-import { isDomainAllowed } from "./http.js";
+import {
+  isDomainAllowed,
+  formatDomainBlockReason,
+  createSafeFetchDispatcher,
+  closeSafeFetchDispatcher,
+} from "./http.js";
+import type { Dispatcher } from "undici";
 import { ensureLazyModule } from "../../utils/lazy-import.js";
+import {
+  closeBrowserSessions,
+  createBrowserSessionTools,
+  resetBrowserSessionsForTestingSync,
+} from "./browser-session.js";
 
 // ============================================================================
 // Types
@@ -24,6 +35,8 @@ export interface BrowserToolConfig {
   readonly mode: "basic" | "advanced";
   readonly allowedDomains?: readonly string[];
   readonly blockedDomains?: readonly string[];
+  /** Allowed host file roots for browser upload actions. */
+  readonly allowedFileUploadPaths?: readonly string[];
   /** Maximum response body size in bytes. Default: 1_048_576 (1 MB). */
   readonly maxResponseBytes?: number;
   /** Request timeout in milliseconds. Default: 30_000. */
@@ -69,7 +82,7 @@ function validateUrl(
     config.blockedDomains,
   );
   if (!check.allowed) {
-    return errorResult(check.reason!);
+    return errorResult(formatDomainBlockReason(check.reason!));
   }
   return null;
 }
@@ -143,13 +156,27 @@ async function fetchHtml(
 > {
   const timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const maxBytes = config.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES;
+  const requestHeaders: Record<string, string> = { "User-Agent": USER_AGENT };
+  let dispatcher: Dispatcher | undefined;
+
+  try {
+    dispatcher = await createSafeFetchDispatcher(url);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return errorResult(formatDomainBlockReason(message));
+  }
+
+  if (dispatcher) {
+    requestHeaders.host = new URL(url).host;
+  }
 
   try {
     const response = await fetch(url, {
       method: "GET",
-      headers: { "User-Agent": USER_AGENT },
+      headers: requestHeaders,
       signal: AbortSignal.timeout(timeoutMs),
       redirect: "manual",
+      dispatcher,
     });
 
     // Manual redirect handling with domain re-validation
@@ -170,9 +197,11 @@ async function fetchHtml(
         config.blockedDomains,
       );
       if (!domainCheck.allowed) {
-        return errorResult(domainCheck.reason!);
+        return errorResult(formatDomainBlockReason(domainCheck.reason!));
       }
       logger.debug(`Following redirect ${response.status} → ${redirectUrl}`);
+      await closeSafeFetchDispatcher(dispatcher);
+      dispatcher = undefined;
       return fetchHtml(redirectUrl, config, logger, redirectCount + 1);
     }
 
@@ -220,6 +249,8 @@ async function fetchHtml(
       return errorResult(`Connection failed: ${err.message}`);
     }
     return errorResult(`Connection failed: ${String(err)}`);
+  } finally {
+    await closeSafeFetchDispatcher(dispatcher);
   }
 }
 
@@ -510,6 +541,7 @@ async function getBrowser(
  * Nulls the reference before awaiting close to prevent stale-reference issues on error.
  */
 export async function closeBrowser(): Promise<void> {
+  await closeBrowserSessions();
   if (browserInstance) {
     const b = browserInstance;
     browserInstance = null;
@@ -522,6 +554,7 @@ export function _resetForTesting(): void {
   cheerioLoad = null;
   browserInstance = null;
   browserLaunchPromise = null;
+  resetBrowserSessionsForTestingSync();
 }
 
 // ============================================================================
@@ -1012,7 +1045,7 @@ function createExportPdfTool(config: BrowserToolConfig, logger: Logger): Tool {
  * Create browser tools for web content extraction.
  *
  * - Basic mode (default): 3 tools using fetch + cheerio (system.browse, system.extractLinks, system.htmlToMarkdown)
- * - Advanced mode: 7 tools (3 basic + 4 Playwright tools: system.screenshot, system.browserAction, system.evaluateJs, system.exportPdf)
+ * - Advanced mode: 12 tools (3 basic + 4 Playwright one-shot tools + 5 durable browser session tools)
  *
  * @param config - Optional configuration for mode, domain control, timeouts, etc.
  * @param logger - Optional logger instance (defaults to silent).
@@ -1068,6 +1101,7 @@ export function createBrowserTools(
     createBrowserActionTool(cfg, log),
     createEvaluateJsTool(cfg, log),
     createExportPdfTool(cfg, log),
+    ...createBrowserSessionTools(cfg, log),
   ];
 
   return [...basicTools, ...advancedTools];

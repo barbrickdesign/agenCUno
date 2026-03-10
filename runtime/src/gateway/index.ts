@@ -1,6 +1,11 @@
 export type {
   GatewayConfig,
   GatewayLLMConfig,
+  GatewaySubagentConfig,
+  GatewaySubagentPolicyLearningConfig,
+  GatewaySubagentMode,
+  GatewaySubagentChildToolAllowlistStrategy,
+  GatewaySubagentFallbackBehavior,
   GatewayMemoryConfig,
   GatewayChannelConfig,
   GatewayAgentConfig,
@@ -11,6 +16,9 @@ export type {
   GatewayTelemetryConfig,
   GatewayState,
   GatewayStatus,
+  GatewayBackgroundRunAlert,
+  GatewayBackgroundRunMetrics,
+  GatewayBackgroundRunStatus,
   GatewayEvent,
   GatewayEventHandler,
   GatewayEventSubscription,
@@ -141,6 +149,8 @@ export type {
   IsolatedSessionContext,
   SessionIsolationManagerConfig,
   AuthState,
+  SessionContextIdentity,
+  SubAgentSessionIdentity,
 } from "./session-isolation.js";
 export { SessionIsolationManager } from "./session-isolation.js";
 
@@ -181,6 +191,37 @@ export {
   type ProgressEntry,
   type ProgressTrackerConfig,
 } from "./progress.js";
+
+export type {
+  DurableSubrunAdmissionDecision,
+  DurableSubrunTreeNode,
+  DurableSubrunPlanStartResult,
+} from "./durable-subrun-orchestrator.js";
+export {
+  DurableSubrunOrchestrator,
+  redundancyPatternProvenUseful,
+} from "./durable-subrun-orchestrator.js";
+
+export type {
+  AutonomyRolloutFeature,
+  AutonomyIncidentScenario,
+  AutonomyRolloutDocRef,
+  AutonomyDrillCheck,
+  AutonomyRolloutManifest,
+  AutonomyObservedSloMetrics,
+  AutonomyRolloutViolation,
+  AutonomyExternalGate,
+  AutonomyCanaryDecision,
+  AutonomyRolloutEvaluation,
+  AutonomyRolloutEvaluationInput,
+} from "./autonomy-rollout.js";
+export {
+  AUTONOMY_ROLLOUT_MANIFEST_SCHEMA_VERSION,
+  parseAutonomyRolloutManifest,
+  buildObservedAutonomySloMetrics,
+  evaluateAutonomyRolloutReadiness,
+  evaluateAutonomyCanaryAdmission,
+} from "./autonomy-rollout.js";
 
 // Voice Bridge (xAI Realtime)
 export { VoiceBridge, type VoiceBridgeConfig } from "./voice-bridge.js";
@@ -240,9 +281,13 @@ export type {
   ElevatedModeConfig,
   ApprovalRequest,
   ApprovalResponse,
+  ApprovalResolverIdentity,
   ApprovalDisposition,
+  ApprovalEscalation,
   ApprovalEngineConfig,
+  ApprovalRequestHandler,
   ApprovalResponseHandler,
+  ApprovalEscalationHandler,
 } from "./approvals.js";
 
 export {
@@ -253,10 +298,40 @@ export {
   extractAmount,
 } from "./approvals.js";
 
+// Webhook routing
+export {
+  WebhookRouteRegistry,
+  WebhookRouter,
+  type WebhookRoute,
+  type WebhookRouteMatch,
+  type WebhookMethod,
+  type WebhookRequest,
+  type WebhookResponse,
+  type WebhookHandler,
+} from "./webhooks.js";
+
+// Run domains
+export {
+  createApprovalRunDomain,
+  createBrowserRunDomain,
+  createDesktopGuiRunDomain,
+  createGenericRunDomain,
+  createPipelineRunDomain,
+  createRemoteMcpRunDomain,
+  createResearchRunDomain,
+  createWorkspaceRunDomain,
+  verificationSupportsContinuation,
+  type RunDomain,
+  type RunDomainExecutionContext,
+  type RunDomainNativeCycleResult,
+  type RunDomainRun,
+  type RunDomainVerification,
+  type RunDomainVerifierState,
+} from "./run-domains.js";
+
 // Channel plugin (Phase 1.5)
 export {
   PluginCatalog,
-  WebhookRouter,
   BaseChannelPlugin,
   ChannelNameInvalidError,
   ChannelAlreadyRegisteredError,
@@ -264,11 +339,6 @@ export {
   type ChannelPlugin,
   type ChannelContext,
   type PluginCatalogConfig,
-  type WebhookRoute,
-  type WebhookMethod,
-  type WebhookRequest,
-  type WebhookResponse,
-  type WebhookHandler,
   type ReactionEvent,
 } from "./channel.js";
 
@@ -353,5 +423,7 @@ export {
   SubAgentManager,
   DEFAULT_SUB_AGENT_TIMEOUT_MS,
   MAX_CONCURRENT_SUB_AGENTS,
+  DEFAULT_MAX_RETAINED_TERMINAL_SUB_AGENTS,
+  DEFAULT_TERMINAL_SUB_AGENT_RETENTION_MS,
   SUB_AGENT_SESSION_PREFIX,
 } from "./sub-agent.js";
